@@ -111,3 +111,9 @@ If this is wanted again later: it requires LibreOffice actually installed on the
 - `.github/workflows/release.yml`: on a `v*` tag, checks the tag matches the header `Version:`, lints PHP, builds `adapt-sitemap-manager.zip` with `git archive` (respecting `.gitattributes` export-ignore) and publishes the release.
 - Release process and first-install notes are in `README.md`.
 - Verified with a mocked GitHub release: update offered, changelog shown, plugin replaced in place from a GitHub-style archive folder.
+
+## 9. IDs in the sitemap XML (v1.2.1)
+
+- Every `<url>` in all three sitemaps now includes the WordPress ID: `<adsx:post_id>` in the post and download sitemaps (the article ID), `<adsx:attachment_id>` in the media sitemap.
+- The `adsx` prefix is declared on `<urlset>` by `adsx_sitemap_urlset_open()`, using the namespace URI in `ADSX_XML_NS` (the GitHub repository URL). Extension elements in their own namespace are allowed by the sitemaps.org protocol and ignored by search engines.
+- Verified on a test WordPress install: all three sitemaps render the IDs and parse as well-formed XML.

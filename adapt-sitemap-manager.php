@@ -4,7 +4,7 @@
  * Plugin URI:        https://github.com/johnbadapt23/adapt_sitemap_manager
  * Description:       Unified sitemap manager for media attachments, posts, and ACF subscription downloads. Configure under Settings > Sitemap Manager.
  * Author:            Adapt
- * Version:           1.2.0
+ * Version:           1.2.1
  * Requires at least: 5.8
  * Requires PHP:      7.4
  * Update URI:        https://github.com/johnbadapt23/adapt_sitemap_manager
@@ -47,6 +47,7 @@ define( 'ADSX_DEFAULT_DATE_FROM', '2023-01-01' );
 define( 'ADSX_POST_TAXONOMIES',    'adsx_post_taxonomies' );
 define( 'ADSX_POST_TERMS',         'adsx_post_terms' );
 define( 'ADSX_POST_TAX_RELATION',  'adsx_post_tax_relation' );
+define( 'ADSX_XML_NS',              'https://github.com/johnbadapt23/adapt_sitemap_manager' );
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // 1. MEDIA SITEMAP HELPERS
@@ -1874,6 +1875,19 @@ add_action( 'admin_post_adsx_download_all', function () {
 // 8. FRONTEND: SERVE XML SITEMAPS
 // ═══════════════════════════════════════════════════════════════════════════════
 
+/**
+ * Opening <urlset> tag shared by all three sitemaps.
+ *
+ * Declares an extra "adsx" XML namespace so each <url> can carry the
+ * WordPress ID (<adsx:post_id> or <adsx:attachment_id>) for easy
+ * cross-referencing. Elements in a separate namespace are permitted by the
+ * sitemaps.org protocol and are ignored by search engines, so the sitemaps
+ * remain valid.
+ */
+function adsx_sitemap_urlset_open() {
+    return '<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9" xmlns:adsx="' . esc_attr( ADSX_XML_NS ) . '">' . "\n";
+}
+
 add_action( 'init', function () {
 
     $request_base = basename( parse_url( $_SERVER['REQUEST_URI'] ?? '', PHP_URL_PATH ) );
@@ -1899,12 +1913,13 @@ add_action( 'init', function () {
         header( 'X-Robots-Tag: noindex, follow', true );
 
         echo '<?xml version="1.0" encoding="UTF-8"?>' . "\n";
-        echo '<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">' . "\n";
+        echo adsx_sitemap_urlset_open();
 
         foreach ( $items as $item ) {
             echo "  <url>\n";
             echo '    <loc>' . esc_url( $item['url'] ) . "</loc>\n";
             echo '    <lastmod>' . esc_html( get_the_modified_date( 'c', $item['attachment']->ID ) ) . "</lastmod>\n";
+            echo '    <adsx:attachment_id>' . (int) $item['attachment']->ID . "</adsx:attachment_id>\n";
             echo "  </url>\n";
         }
 
@@ -1925,12 +1940,13 @@ add_action( 'init', function () {
         header( 'X-Robots-Tag: noindex, follow', true );
 
         echo '<?xml version="1.0" encoding="UTF-8"?>' . "\n";
-        echo '<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">' . "\n";
+        echo adsx_sitemap_urlset_open();
 
         foreach ( $post_ids as $post_id ) {
             echo "  <url>\n";
             echo '    <loc>' . esc_url( get_permalink( $post_id ) ) . "</loc>\n";
             echo '    <lastmod>' . esc_html( get_post_modified_time( 'c', true, $post_id ) ) . "</lastmod>\n";
+            echo '    <adsx:post_id>' . (int) $post_id . "</adsx:post_id>\n";
             echo "  </url>\n";
         }
 
@@ -1951,12 +1967,13 @@ add_action( 'init', function () {
         header( 'X-Robots-Tag: noindex, follow', true );
 
         echo '<?xml version="1.0" encoding="UTF-8"?>' . "\n";
-        echo '<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">' . "\n";
+        echo adsx_sitemap_urlset_open();
 
         foreach ( $entries as $entry ) {
             echo "  <url>\n";
             echo '    <loc>' . esc_url( $entry['url'] ) . "</loc>\n";
             echo '    <lastmod>' . esc_html( $entry['lastmod'] ) . "</lastmod>\n";
+            echo '    <adsx:post_id>' . (int) $entry['post_id'] . "</adsx:post_id>\n";
             echo "  </url>\n";
         }
 

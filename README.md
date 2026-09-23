@@ -6,6 +6,18 @@ WordPress plugin that serves three sitemaps, configured under **Settings > Sitem
 - **Post sitemap** (`/post-sitemap.xml`): published posts filtered by modified date and, optionally, by taxonomy terms.
 - **Download sitemap** (`/download-sitemap.xml`): posts in a subscription term, linking to the resolved download file or the permalink.
 
+Each `<url>` entry also carries the WordPress ID, so sitemap entries can be matched to posts or media in the admin, exports or the database:
+
+```xml
+<url>
+  <loc>https://example.com/insights/article/</loc>
+  <lastmod>2026-09-01T02:00:00+00:00</lastmod>
+  <adsx:post_id>12345</adsx:post_id>
+</url>
+```
+
+The post and download sitemaps use `<adsx:post_id>` (for the download sitemap this is the article's ID, not the file's). The media sitemap uses `<adsx:attachment_id>`. These elements sit in their own XML namespace, which the sitemaps.org protocol permits and search engines ignore, so the sitemaps remain valid.
+
 ## Post sitemap taxonomy filter
 
 1. Tick one or more taxonomies (for example Categories, Tags or any custom taxonomy registered for posts).
