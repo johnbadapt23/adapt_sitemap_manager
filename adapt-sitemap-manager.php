@@ -1,13 +1,29 @@
 <?php
 /**
- * Plugin Name: Adapt Sitemap Manager
- * Description: Unified sitemap manager for media attachments, posts, and ACF subscription downloads. Configure under Settings > Sitemap Manager.
- * Author: Adapt
- * Version: 1.1.1
+ * Plugin Name:       Adapt Sitemap Manager
+ * Plugin URI:        https://github.com/johnbadapt23/adapt_sitemap_manager
+ * Description:       Unified sitemap manager for media attachments, posts, and ACF subscription downloads. Configure under Settings > Sitemap Manager.
+ * Author:            Adapt
+ * Version:           1.2.0
+ * Requires at least: 5.8
+ * Requires PHP:      7.4
+ * Update URI:        https://github.com/johnbadapt23/adapt_sitemap_manager
  */
 
 if ( ! defined( 'ABSPATH' ) ) {
     exit;
+}
+
+// ─── Self-updater (GitHub releases) ───────────────────────────────────────────
+// Pushing a version tag (e.g. v1.2.1) to the repository triggers a GitHub
+// Action that builds and publishes a release; WordPress then offers it as a
+// normal plugin update under Dashboard > Updates and Plugins.
+define( 'ADSX_GITHUB_REPO', 'johnbadapt23/adapt_sitemap_manager' );
+
+require_once __DIR__ . '/includes/class-adsx-github-updater.php';
+
+if ( is_admin() || wp_doing_cron() || ( defined( 'WP_CLI' ) && WP_CLI ) ) {
+    new ADSX_GitHub_Updater( __FILE__, ADSX_GITHUB_REPO );
 }
 
 // ─── Option keys ───────────────────────────────────────────────────────────────
@@ -28,6 +44,9 @@ define( 'ADSX_OPTION_FILENAME_FORMAT',   'adsx_filename_format' );
 define( 'ADSX_DEFAULT_FILENAME_FORMAT',  'custom' );
 define( 'ADSX_OPTION_SKIP_DUPLICATES',   'adsx_skip_duplicate_filenames' );
 define( 'ADSX_DEFAULT_DATE_FROM', '2023-01-01' );
+define( 'ADSX_POST_TAXONOMIES',    'adsx_post_taxonomies' );
+define( 'ADSX_POST_TERMS',         'adsx_post_terms' );
+define( 'ADSX_POST_TAX_RELATION',  'adsx_post_tax_relation' );
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // 1. MEDIA SITEMAP HELPERS
@@ -117,29 +136,148 @@ function adsx_get_media_attachments( $date_from = null, $date_to = null ) {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 /**
+ * Taxonomies that can be used to filter the post sitemap: every taxonomy
+ * registered for the `post` post type that has an admin UI (post formats
+ * excluded). Keyed by taxonomy name.
+ *
+ * @return WP_Taxonomy[]
+ */
+function adsx_get_post_filter_taxonomies() {
+
+    $taxonomies = get_object_taxonomies( 'post', 'objects' );
+    $out        = [];
+
+    foreach ( $taxonomies as $taxonomy ) {
+        if ( empty( $taxonomy->show_ui ) || $taxonomy->name === 'post_format' ) continue;
+        $out[ $taxonomy->name ] = $taxonomy;
+    }
+
+    return $out;
+}
+
+/**
+ * Cleans a raw taxonomy filter (from saved options or live AJAX params)
+ * into a predictable shape:
+ *
+ *   [ 'taxonomies' => string[], 'term_ids' => int[], 'relation' => 'OR'|'AND' ]
+ *
+ * Unknown taxonomies are dropped, and term IDs are only kept when the term
+ * actually belongs to one of the selected taxonomies (so a term left ticked
+ * under a taxonomy that was later deselected has no effect).
+ */
+function adsx_normalize_post_tax_filter( $taxonomies, $term_ids, $relation ) {
+
+    $valid      = array_keys( adsx_get_post_filter_taxonomies() );
+    $taxonomies = array_values( array_intersect(
+        array_unique( array_map( 'sanitize_key', (array) $taxonomies ) ),
+        $valid
+    ) );
+
+    $term_ids = array_values( array_unique( array_filter( array_map( 'absint', (array) $term_ids ) ) ) );
+    $relation = is_string( $relation ) && strtoupper( $relation ) === 'AND' ? 'AND' : 'OR';
+
+    $terms_by_tax = array_fill_keys( $taxonomies, [] );
+
+    if ( $taxonomies && $term_ids ) {
+        $terms = get_terms( [
+            'taxonomy'   => $taxonomies,
+            'include'    => $term_ids,
+            'hide_empty' => false,
+        ] );
+        if ( ! is_wp_error( $terms ) ) {
+            foreach ( $terms as $term ) {
+                $terms_by_tax[ $term->taxonomy ][] = (int) $term->term_id;
+            }
+        }
+    }
+
+    return [
+        'taxonomies'   => $taxonomies,
+        'term_ids'     => $taxonomies ? array_merge( [], ...array_values( $terms_by_tax ) ) : [],
+        'terms_by_tax' => $terms_by_tax,
+        'relation'     => $relation,
+    ];
+}
+
+/**
+ * Returns the saved post sitemap taxonomy filter, normalised.
+ */
+function adsx_get_saved_post_tax_filter() {
+    return adsx_normalize_post_tax_filter(
+        get_option( ADSX_POST_TAXONOMIES, [] ),
+        get_option( ADSX_POST_TERMS, [] ),
+        get_option( ADSX_POST_TAX_RELATION, 'OR' )
+    );
+}
+
+/**
+ * Builds a WP_Query `tax_query` from a normalised taxonomy filter.
+ *
+ * - No taxonomies selected: no filtering (empty array).
+ * - A selected taxonomy with no terms ticked: the post must have at least
+ *   one term in that taxonomy (EXISTS).
+ * - Relation "OR" (any): a post matches if it has ANY of the selected terms.
+ * - Relation "AND" (all): a post must have EVERY selected term.
+ */
+function adsx_build_post_tax_query( array $filter ) {
+
+    if ( empty( $filter['taxonomies'] ) ) return [];
+
+    $match_all = $filter['relation'] === 'AND';
+    $clauses   = [];
+
+    foreach ( $filter['taxonomies'] as $taxonomy ) {
+        $ids = $filter['terms_by_tax'][ $taxonomy ] ?? [];
+
+        if ( empty( $ids ) ) {
+            $clauses[] = [ 'taxonomy' => $taxonomy, 'operator' => 'EXISTS' ];
+            continue;
+        }
+
+        $clauses[] = [
+            'taxonomy' => $taxonomy,
+            'field'    => 'term_id',
+            'terms'    => $ids,
+            'operator' => $match_all ? 'AND' : 'IN',
+        ];
+    }
+
+    if ( count( $clauses ) > 1 ) {
+        $clauses['relation'] = $match_all ? 'AND' : 'OR';
+    }
+
+    return $clauses;
+}
+
+/**
  * Returns post IDs for the post sitemap.
  *
  * - Published posts within the configured date range (by modified date)
+ * - Optionally restricted to selected taxonomies/terms
  * - Deduped by permalink
  * - When $check_404 is true, each URL is HEAD-checked (accurate but slow)
  * - When $check_404 is false, HEAD checks are skipped (fast, used for the counter)
  *
- * @param bool        $check_404 Whether to live-check each URL for 404s.
- * @param string|null $date_from Override start date (YYYY-MM-DD). Empty = use saved option (fallback: 2023-01-01).
- * @param string|null $date_to   Override end date (YYYY-MM-DD).   Empty = use saved option (fallback: today).
+ * @param bool        $check_404  Whether to live-check each URL for 404s.
+ * @param string|null $date_from  Override start date (YYYY-MM-DD). Empty = use saved option (fallback: 2023-01-01).
+ * @param string|null $date_to    Override end date (YYYY-MM-DD).   Empty = use saved option (fallback: today).
+ * @param array|null  $tax_filter Normalised filter from adsx_normalize_post_tax_filter(). Null = use saved options.
  */
-function adsx_get_post_ids( $check_404 = true, $date_from = null, $date_to = null ) {
+function adsx_get_post_ids( $check_404 = true, $date_from = null, $date_to = null, $tax_filter = null ) {
 
-    $date_from = $date_from ?? get_option( ADSX_POST_DATE_FROM, '' );
-    $date_to   = $date_to   ?? get_option( ADSX_POST_DATE_TO,   '' );
+    $date_from  = $date_from  ?? get_option( ADSX_POST_DATE_FROM, '' );
+    $date_to    = $date_to    ?? get_option( ADSX_POST_DATE_TO,   '' );
+    $tax_filter = $tax_filter ?? adsx_get_saved_post_tax_filter();
 
     // Fallbacks: empty start → 2023-01-01, empty end → today.
     if ( empty( $date_from ) ) $date_from = ADSX_DEFAULT_DATE_FROM;
     if ( empty( $date_to ) )   $date_to   = current_time( 'Y-m-d' );
 
     $date_clause = [ 'column' => 'post_modified_gmt', 'after' => $date_from, 'before' => $date_to, 'inclusive' => true ];
+    $tax_query   = adsx_build_post_tax_query( $tax_filter );
 
     $query = new WP_Query( [
+        'tax_query'              => $tax_query,
         'post_type'              => 'post',
         'post_status'            => 'publish',
         'posts_per_page'         => -1,
@@ -608,8 +746,23 @@ add_action( 'wp_ajax_adsx_count_post', function () {
     $date_from = isset( $_GET['date_from'] ) ? sanitize_text_field( wp_unslash( $_GET['date_from'] ) ) : null;
     $date_to   = isset( $_GET['date_to'] )   ? sanitize_text_field( wp_unslash( $_GET['date_to'] ) )   : null;
 
+    // Live taxonomy filter from the form (sent even when empty, so "nothing
+    // selected" is distinguishable from "not sent"). Falls back to saved options.
+    $tax_filter = null;
+    if ( isset( $_GET['post_taxonomies'] ) ) {
+        $split = function ( $key ) {
+            $raw = isset( $_GET[ $key ] ) ? sanitize_text_field( wp_unslash( $_GET[ $key ] ) ) : '';
+            return $raw === '' ? [] : explode( ',', $raw );
+        };
+        $tax_filter = adsx_normalize_post_tax_filter(
+            $split( 'post_taxonomies' ),
+            $split( 'post_terms' ),
+            isset( $_GET['post_relation'] ) ? sanitize_key( wp_unslash( $_GET['post_relation'] ) ) : 'or'
+        );
+    }
+
     // Skip 404 check here — too slow for a live counter.
-    wp_send_json_success( [ 'count' => count( adsx_get_post_ids( false, $date_from, $date_to ) ) ] );
+    wp_send_json_success( [ 'count' => count( adsx_get_post_ids( false, $date_from, $date_to, $tax_filter ) ) ] );
 } );
 
 add_action( 'wp_ajax_adsx_count_download', function () {
@@ -691,7 +844,72 @@ add_action( 'admin_init', function () {
         'sanitize_callback' => fn( $v ) => $v === '1' ? '1' : '0',
         'default'           => '0',
     ] );
+
+    // Post sitemap taxonomy filter. Unticking everything posts nothing for
+    // these fields, which options.php passes through as null — both
+    // callbacks turn that into an empty array.
+    register_setting( 'adsx_settings', ADSX_POST_TAXONOMIES, [
+        'type'              => 'array',
+        'sanitize_callback' => function ( $v ) {
+            $valid = array_keys( adsx_get_post_filter_taxonomies() );
+            return array_values( array_intersect( array_unique( array_map( 'sanitize_key', (array) $v ) ), $valid ) );
+        },
+        'default'           => [],
+    ] );
+
+    register_setting( 'adsx_settings', ADSX_POST_TERMS, [
+        'type'              => 'array',
+        'sanitize_callback' => fn( $v ) => array_values( array_unique( array_filter( array_map( 'absint', (array) $v ) ) ) ),
+        'default'           => [],
+    ] );
+
+    register_setting( 'adsx_settings', ADSX_POST_TAX_RELATION, [
+        'type'              => 'string',
+        'sanitize_callback' => fn( $v ) => $v === 'AND' ? 'AND' : 'OR',
+        'default'           => 'OR',
+    ] );
 } );
+
+/**
+ * Returns a taxonomy's terms in hierarchical display order, each with a
+ * `depth` property for indentation. Flat taxonomies come back sorted by name.
+ */
+function adsx_get_terms_for_filter( $taxonomy ) {
+
+    $terms = get_terms( [
+        'taxonomy'   => $taxonomy,
+        'hide_empty' => false,
+        'orderby'    => 'name',
+        'order'      => 'ASC',
+    ] );
+
+    if ( is_wp_error( $terms ) || empty( $terms ) ) return [];
+
+    if ( ! is_taxonomy_hierarchical( $taxonomy ) ) {
+        foreach ( $terms as $term ) $term->depth = 0;
+        return $terms;
+    }
+
+    $children = [];
+    $ids      = wp_list_pluck( $terms, 'term_id' );
+    foreach ( $terms as $term ) {
+        // Orphans (parent not in the list) are treated as top level.
+        $parent = in_array( (int) $term->parent, $ids, true ) ? (int) $term->parent : 0;
+        $children[ $parent ][] = $term;
+    }
+
+    $ordered = [];
+    $walk    = function ( $parent, $depth ) use ( &$walk, &$ordered, $children ) {
+        foreach ( $children[ $parent ] ?? [] as $term ) {
+            $term->depth = $depth;
+            $ordered[]   = $term;
+            $walk( (int) $term->term_id, $depth + 1 );
+        }
+    };
+    $walk( 0, 0 );
+
+    return $ordered;
+}
 
 function adsx_render_settings_page() {
 
@@ -712,6 +930,11 @@ function adsx_render_settings_page() {
     $download_date_from = get_option( ADSX_DOWNLOAD_DATE_FROM, '' );
     $download_date_to   = get_option( ADSX_DOWNLOAD_DATE_TO,   '' );
     $today              = current_time( 'Y-m-d' );
+
+    $post_filter_taxonomies = adsx_get_post_filter_taxonomies();
+    $post_selected_taxes    = array_map( 'strval', (array) get_option( ADSX_POST_TAXONOMIES, [] ) );
+    $post_selected_terms    = array_map( 'intval', (array) get_option( ADSX_POST_TERMS, [] ) );
+    $post_tax_relation      = get_option( ADSX_POST_TAX_RELATION, 'OR' ) === 'AND' ? 'AND' : 'OR';
 
     $terms     = get_terms( [ 'taxonomy' => 'subscription', 'hide_empty' => false ] );
     $has_terms = ! is_wp_error( $terms ) && ! empty( $terms );
@@ -831,7 +1054,7 @@ function adsx_render_settings_page() {
                 <code style="margin-left:8px;font-size:12px;"><?php echo esc_html( home_url( '/post-sitemap.xml' ) ); ?></code>
 
                 <p style="<?php echo esc_attr( $desc ); ?>">
-                    Published posts filtered by modified date, sorted newest first.
+                    Published posts filtered by modified date and, optionally, by taxonomy terms, sorted newest first.
                     Each URL is live 404-checked when the sitemap is served (may be slow on large sites).
                 </p>
 
@@ -864,6 +1087,109 @@ function adsx_render_settings_page() {
                                 </p>
                             </td>
                         </tr>
+                        <tr>
+                            <th style="width:150px;padding:6px 10px 6px 0;font-weight:600;">Taxonomies</th>
+                            <td style="padding:6px 0;">
+                                <?php if ( empty( $post_filter_taxonomies ) ) : ?>
+                                    <em style="color:#646970;">No taxonomies are registered for posts.</em>
+                                <?php else : ?>
+                                    <div id="adsx-post-tax-list" style="display:flex;flex-wrap:wrap;gap:6px 18px;">
+                                        <?php foreach ( $post_filter_taxonomies as $tax_name => $tax_obj ) : ?>
+                                            <label style="white-space:nowrap;">
+                                                <input type="checkbox"
+                                                       class="adsx-post-tax-cb"
+                                                       name="<?php echo esc_attr( ADSX_POST_TAXONOMIES ); ?>[]"
+                                                       value="<?php echo esc_attr( $tax_name ); ?>"
+                                                       <?php checked( in_array( $tax_name, $post_selected_taxes, true ) ); ?>>
+                                                <?php echo esc_html( $tax_obj->labels->name ); ?>
+                                                <code style="font-size:11px;"><?php echo esc_html( $tax_name ); ?></code>
+                                            </label>
+                                        <?php endforeach; ?>
+                                    </div>
+                                    <p style="margin:6px 0 0;color:#646970;font-size:12px;">
+                                        Leave all unticked to include every post. Select one or more taxonomies to choose terms below.
+                                    </p>
+                                <?php endif; ?>
+                            </td>
+                        </tr>
+                        <?php if ( ! empty( $post_filter_taxonomies ) ) : ?>
+                        <tr id="adsx-post-terms-row">
+                            <th style="width:150px;padding:6px 10px 6px 0;font-weight:600;">Terms</th>
+                            <td style="padding:6px 0;">
+                                <p id="adsx-post-terms-empty" style="margin:0;color:#646970;font-size:12px;">
+                                    No taxonomy selected, so no term filter is applied.
+                                </p>
+                                <?php foreach ( $post_filter_taxonomies as $tax_name => $tax_obj ) :
+                                    $tax_terms  = adsx_get_terms_for_filter( $tax_name );
+                                    $tax_active = in_array( $tax_name, $post_selected_taxes, true );
+                                    ?>
+                                    <div class="adsx-post-term-group"
+                                         data-taxonomy="<?php echo esc_attr( $tax_name ); ?>"
+                                         style="margin:0 0 12px;<?php echo $tax_active ? '' : 'display:none;'; ?>">
+                                        <div style="display:flex;align-items:center;gap:10px;margin:0 0 4px;flex-wrap:wrap;">
+                                            <strong><?php echo esc_html( $tax_obj->labels->name ); ?></strong>
+                                            <span class="adsx-term-selected-count" style="color:#646970;font-size:12px;"></span>
+                                            <?php if ( ! empty( $tax_terms ) ) : ?>
+                                                <input type="search" class="adsx-term-search"
+                                                       placeholder="Search terms"
+                                                       aria-label="<?php echo esc_attr( 'Search ' . $tax_obj->labels->name ); ?>"
+                                                       style="margin-left:auto;min-width:180px;">
+                                                <button type="button" class="button-link adsx-term-select-all">Select all</button>
+                                                <button type="button" class="button-link adsx-term-clear">Clear</button>
+                                            <?php endif; ?>
+                                        </div>
+                                        <?php if ( empty( $tax_terms ) ) : ?>
+                                            <em style="color:#646970;font-size:12px;">No terms in this taxonomy.</em>
+                                        <?php else : ?>
+                                            <div class="adsx-term-box"
+                                                 style="max-height:220px;overflow:auto;border:1px solid #dcdcde;border-radius:3px;padding:6px 10px;background:#fff;">
+                                                <?php foreach ( $tax_terms as $term ) : ?>
+                                                    <label class="adsx-term-item"
+                                                           data-name="<?php echo esc_attr( strtolower( $term->name ) ); ?>"
+                                                           style="display:block;padding:2px 0 2px <?php echo (int) $term->depth * 18; ?>px;">
+                                                        <input type="checkbox"
+                                                               class="adsx-post-term-cb"
+                                                               name="<?php echo esc_attr( ADSX_POST_TERMS ); ?>[]"
+                                                               value="<?php echo esc_attr( $term->term_id ); ?>"
+                                                               <?php checked( in_array( (int) $term->term_id, $post_selected_terms, true ) ); ?>
+                                                               <?php disabled( ! $tax_active ); ?>>
+                                                        <?php echo esc_html( $term->name ); ?>
+                                                        <span style="color:#646970;">(<?php echo (int) $term->count; ?>)</span>
+                                                    </label>
+                                                <?php endforeach; ?>
+                                            </div>
+                                        <?php endif; ?>
+                                    </div>
+                                <?php endforeach; ?>
+                                <p style="margin:0;color:#646970;font-size:12px;">
+                                    If no terms are ticked for a selected taxonomy, any post with at least one term in that taxonomy is included.
+                                </p>
+                            </td>
+                        </tr>
+                        <tr id="adsx-post-relation-row">
+                            <th style="width:150px;padding:6px 10px 6px 0;font-weight:600;">Match</th>
+                            <td style="padding:6px 0;">
+                                <label style="margin-right:16px;">
+                                    <input type="radio"
+                                           name="<?php echo esc_attr( ADSX_POST_TAX_RELATION ); ?>"
+                                           value="OR"
+                                           <?php checked( $post_tax_relation, 'OR' ); ?>>
+                                    <strong>Any</strong> selected term
+                                </label>
+                                <label>
+                                    <input type="radio"
+                                           name="<?php echo esc_attr( ADSX_POST_TAX_RELATION ); ?>"
+                                           value="AND"
+                                           <?php checked( $post_tax_relation, 'AND' ); ?>>
+                                    <strong>All</strong> selected terms
+                                </label>
+                                <p style="margin:4px 0 0;color:#646970;font-size:12px;">
+                                    <em>Any</em> includes a post that has at least one of the ticked terms.
+                                    <em>All</em> includes only posts that have every ticked term.
+                                </p>
+                            </td>
+                        </tr>
+                        <?php endif; ?>
                     </table>
 
                     <p style="margin:0 0 10px;">
@@ -1125,22 +1451,116 @@ function adsx_render_settings_page() {
 
         // ── Post counter ──────────────────────────────────────────────────────
 
-        var postDateFrom = document.getElementById( 'adsx-post-date-from' );
-        var postDateTo   = document.getElementById( 'adsx-post-date-to' );
-        var postTimer    = null;
+        var postDateFrom       = document.getElementById( 'adsx-post-date-from' );
+        var postDateTo         = document.getElementById( 'adsx-post-date-to' );
+        var postTaxBoxes       = Array.prototype.slice.call( document.querySelectorAll( '.adsx-post-tax-cb' ) );
+        var postTermGroups     = Array.prototype.slice.call( document.querySelectorAll( '.adsx-post-term-group' ) );
+        var postTermsEmpty     = document.getElementById( 'adsx-post-terms-empty' );
+        var postRelationRow    = document.getElementById( 'adsx-post-relation-row' );
+        var postRelationRadios = Array.prototype.slice.call( document.querySelectorAll( 'input[name="<?php echo esc_js( ADSX_POST_TAX_RELATION ); ?>"]' ) );
+        var postTimer          = null;
+
+        function getSelectedPostTaxonomies() {
+            return postTaxBoxes.filter( function ( cb ) { return cb.checked; } )
+                               .map( function ( cb ) { return cb.value; } );
+        }
+
+        function getSelectedPostTerms() {
+            var ids = [];
+            postTermGroups.forEach( function ( group ) {
+                group.querySelectorAll( '.adsx-post-term-cb' ).forEach( function ( cb ) {
+                    if ( cb.checked && ! cb.disabled ) ids.push( cb.value );
+                } );
+            } );
+            return ids;
+        }
+
+        function getPostRelation() {
+            for ( var i = 0; i < postRelationRadios.length; i++ ) {
+                if ( postRelationRadios[ i ].checked ) return postRelationRadios[ i ].value;
+            }
+            return 'OR';
+        }
+
+        function updateTermGroupCount( group ) {
+            var label = group.querySelector( '.adsx-term-selected-count' );
+            if ( ! label ) return;
+            var n = group.querySelectorAll( '.adsx-post-term-cb:checked' ).length;
+            label.textContent = n ? n + ' selected' : 'none selected (any term)';
+        }
+
+        // Show the term list only for ticked taxonomies. Hidden lists are
+        // disabled so their checkboxes are not submitted or counted.
+        function syncPostTermGroups() {
+            var selected = getSelectedPostTaxonomies();
+            postTermGroups.forEach( function ( group ) {
+                var active = selected.indexOf( group.getAttribute( 'data-taxonomy' ) ) !== -1;
+                group.style.display = active ? '' : 'none';
+                group.querySelectorAll( '.adsx-post-term-cb' ).forEach( function ( cb ) { cb.disabled = ! active; } );
+                updateTermGroupCount( group );
+            } );
+            if ( postTermsEmpty )  postTermsEmpty.style.display  = selected.length ? 'none' : '';
+            if ( postRelationRow ) postRelationRow.style.display = selected.length ? '' : 'none';
+        }
 
         function refreshPostCount() {
             clearTimeout( postTimer );
             postTimer = setTimeout( function () {
                 fetchCount( 'adsx_count_post', <?php echo json_encode( $nonce_post ); ?>, {
-                    date_from: postDateFrom ? postDateFrom.value : '',
-                    date_to:   postDateTo   ? postDateTo.value   : '',
+                    date_from:       postDateFrom ? postDateFrom.value : '',
+                    date_to:         postDateTo   ? postDateTo.value   : '',
+                    post_taxonomies: getSelectedPostTaxonomies().join( ',' ),
+                    post_terms:      getSelectedPostTerms().join( ',' ),
+                    post_relation:   getPostRelation(),
                 }, 'adsx-counter-post', 'adsx-spinner-post' );
             }, 400 );
         }
 
+        postTaxBoxes.forEach( function ( cb ) {
+            cb.addEventListener( 'change', function () { syncPostTermGroups(); refreshPostCount(); } );
+        } );
+
+        postRelationRadios.forEach( function ( r ) { r.addEventListener( 'change', refreshPostCount ); } );
+
+        postTermGroups.forEach( function ( group ) {
+            var search = group.querySelector( '.adsx-term-search' );
+            var items  = Array.prototype.slice.call( group.querySelectorAll( '.adsx-term-item' ) );
+
+            group.querySelectorAll( '.adsx-post-term-cb' ).forEach( function ( cb ) {
+                cb.addEventListener( 'change', function () { updateTermGroupCount( group ); refreshPostCount(); } );
+            } );
+
+            if ( search ) {
+                search.addEventListener( 'input', function () {
+                    var q = this.value.trim().toLowerCase();
+                    items.forEach( function ( item ) {
+                        item.style.display = ! q || item.getAttribute( 'data-name' ).indexOf( q ) !== -1 ? 'block' : 'none';
+                    } );
+                } );
+                // Stop Enter in the search box from submitting the settings form.
+                search.addEventListener( 'keydown', function ( e ) { if ( e.key === 'Enter' ) e.preventDefault(); } );
+            }
+
+            // "Select all" only ticks terms currently visible in the search results.
+            function setAll( state ) {
+                items.forEach( function ( item ) {
+                    if ( state && item.style.display === 'none' ) return;
+                    var cb = item.querySelector( '.adsx-post-term-cb' );
+                    if ( cb && ! cb.disabled ) cb.checked = state;
+                } );
+                updateTermGroupCount( group );
+                refreshPostCount();
+            }
+
+            var selectAll = group.querySelector( '.adsx-term-select-all' );
+            var clearAll  = group.querySelector( '.adsx-term-clear' );
+            if ( selectAll ) selectAll.addEventListener( 'click', function () { setAll( true ); } );
+            if ( clearAll )  clearAll.addEventListener(  'click', function () { setAll( false ); } );
+        } );
+
         if ( postDateFrom ) postDateFrom.addEventListener( 'change', refreshPostCount );
         if ( postDateTo )   postDateTo.addEventListener(   'change', refreshPostCount );
+        syncPostTermGroups();
         refreshPostCount();
 
         // ── Download counter (fires on load + on any control change) ──────────

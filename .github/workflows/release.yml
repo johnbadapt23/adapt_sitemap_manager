@@ -1,0 +1,52 @@
+name: Release
+
+# Pushing a version tag (e.g. v1.2.1) builds an installable plugin zip and
+# publishes it as a GitHub release. WordPress sites running the plugin pick
+# the release up as a normal plugin update.
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out the tagged commit
+        uses: actions/checkout@v4
+
+      - name: Confirm the plugin header version matches the tag
+        run: |
+          TAG_VERSION="${GITHUB_REF_NAME#v}"
+          HEADER_VERSION=$(grep -m1 -E '^[[:space:]]*\*[[:space:]]*Version:' adapt-sitemap-manager.php | sed -E 's/.*Version:[[:space:]]*//' | tr -d '[:space:]')
+          echo "Tag version:    $TAG_VERSION"
+          echo "Header version: $HEADER_VERSION"
+          if [ "$TAG_VERSION" != "$HEADER_VERSION" ]; then
+            echo "::error::Tag ${GITHUB_REF_NAME} does not match 'Version: ${HEADER_VERSION}' in adapt-sitemap-manager.php. Update the header, commit, and push a new tag."
+            exit 1
+          fi
+
+      - name: Lint PHP
+        run: |
+          find . -name '*.php' -not -path './.git/*' -print0 | xargs -0 -n1 php -l
+
+      - name: Build the plugin zip
+        run: |
+          mkdir -p build/adapt-sitemap-manager
+          # git archive honours export-ignore in .gitattributes, so only
+          # runtime plugin files end up in the zip.
+          git archive HEAD | tar -x -C build/adapt-sitemap-manager
+          cd build
+          zip -rq ../adapt-sitemap-manager.zip adapt-sitemap-manager
+          cd ..
+          unzip -l adapt-sitemap-manager.zip
+
+      - name: Publish the GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: adapt-sitemap-manager.zip
+          generate_release_notes: true

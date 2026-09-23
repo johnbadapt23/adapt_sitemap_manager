@@ -1,6 +1,6 @@
 # Adapt Sitemap Manager — Work Log / Handoff Notes
 
-Plugin file: `adapt-sitemap-manager.php` (currently still labeled `Version: 1.1.1` in the header — worth bumping to `1.2.0` on next deploy, since a large number of behavioral changes have landed since that version number was set).
+Plugin file: `adapt-sitemap-manager.php` (now `Version: 1.2.0`; see section 8). Repository: https://github.com/johnbadapt23/adapt_sitemap_manager
 
 This document summarizes everything changed in this session, in the order the underlying problems were found, so work can continue from a fresh session/account without re-deriving context.
 
@@ -86,3 +86,28 @@ If this is wanted again later: it requires LibreOffice actually installed on the
 2. Run a full "Download All Files" export and confirm the "Items found" count now matches the actual ZIP file count, using today's `adsx_url_to_local_path()`-based logic.
 3. If any specific post's file is still missing, run `wp eval 'adsx_debug_download_url( POST_ID );'` first before making further code changes — it will show exactly which of the four resolution tiers (preview_module / slide_preview_module / download_link / share_download_url) should be firing and why it isn't.
 4. Check `debug.log` for any `ADSX:` prefixed entries after an export — they now explain every skip (fetch failure, empty response, duplicate skipped) instead of failing silently.
+
+## 8. Post Sitemap taxonomy filter and GitHub updater (v1.2.0)
+
+### Taxonomy filter (Post Sitemap card)
+
+- New options: `adsx_post_taxonomies` (array of taxonomy names), `adsx_post_terms` (array of term IDs), `adsx_post_tax_relation` (`OR` or `AND`, default `OR`).
+- Selectable taxonomies are every taxonomy registered for `post` with `show_ui` (post formats excluded), via `adsx_get_post_filter_taxonomies()`.
+- UI: tick one or more taxonomies; each ticked taxonomy shows a scrollable, searchable checkbox list of its terms (hierarchical taxonomies are indented), with "Select all" (visible search results only) and "Clear". Term lists for unticked taxonomies are hidden and disabled, so they are neither submitted nor counted.
+- Matching (`adsx_build_post_tax_query()`):
+  - "Any selected term" (`OR`): post has at least one ticked term.
+  - "All selected terms" (`AND`): post has every ticked term.
+  - A ticked taxonomy with no terms ticked means "has any term in this taxonomy" (`EXISTS`).
+  - Hierarchical terms include their children (WordPress default).
+- `adsx_normalize_post_tax_filter()` drops unknown taxonomies and any term that does not belong to a ticked taxonomy.
+- Wired into the XML sitemap (saved options) and the live "Items found" counter (sends `post_taxonomies`, `post_terms`, `post_relation`).
+- Verified against a real WordPress 6.8 install: all combinations of any/all, EXISTS, parent/child categories and save/reload produced the expected posts.
+
+### Self-updater
+
+- `includes/class-adsx-github-updater.php`, bootstrapped from the main file with `ADSX_GITHUB_REPO`.
+- Reads the latest GitHub release (prefers a `.zip` asset; falls back to the release source archive). Only if the repo has no releases does it fall back to the highest version tag.
+- Hooks: `pre_set_site_transient_update_plugins` (update notice and auto-update toggle), `plugins_api` ("View details" modal with release notes), `upgrader_source_selection` (renames GitHub's extracted folder to the installed plugin folder), plus a "Check for updates" row link that bypasses the six-hour cache.
+- `.github/workflows/release.yml`: on a `v*` tag, checks the tag matches the header `Version:`, lints PHP, builds `adapt-sitemap-manager.zip` with `git archive` (respecting `.gitattributes` export-ignore) and publishes the release.
+- Release process and first-install notes are in `README.md`.
+- Verified with a mocked GitHub release: update offered, changelog shown, plugin replaced in place from a GitHub-style archive folder.
